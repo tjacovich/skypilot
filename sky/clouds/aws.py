@@ -511,7 +511,7 @@ class AWS(clouds.Cloud):
             return False, str(e)
 
         static_credential_exists = os.path.isfile(
-            os.path.expanduser('~/.aws/credentials'))
+            os.environ.get("AWS_SHARED_CREDENTIALS_FILE"))
         hints = None
         identity_type = cls._current_identity_type()
         single_cloud_hint = (
