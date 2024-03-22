@@ -739,9 +739,9 @@ class AWS(clouds.Cloud):
         ) != AWSIdentityType.SHARED_CREDENTIALS_FILE:
             return {}
         return {
-            f'~/.aws/{filename}': f'~/.aws/{filename}'
+            f'{os.environ.get("AWS_SHARED_CREDENTIALS_FILE", f"~/.aws/{filename}")}': f'{os.environ.get("AWS_SHARED_CREDENTIALS_FILE", f"~/.aws/{filename}")}'
             for filename in _CREDENTIAL_FILES
-            if os.path.exists(os.path.expanduser(f'~/.aws/{filename}'))
+            if os.path.exists(os.path.expanduser(f'{os.environ.get("AWS_SHARED_CREDENTIALS_FILE", f"~/.aws/{filename}")}'))
         }
 
     def instance_type_exists(self, instance_type):
