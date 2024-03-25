@@ -67,7 +67,7 @@ from sky.utils import schemas
 ENV_VAR_SKYPILOT_CONFIG = 'SKYPILOT_CONFIG'
 
 # Path to the local config file.
-CONFIG_PATH = '~/.sky/config.yaml'
+CONFIG_PATH = os.environ.get("SKYPILOT_LOCAL_CONFIG_PATH", '~/.sky/config.yaml')
 
 logger = sky_logging.init_logger(__name__)
 
