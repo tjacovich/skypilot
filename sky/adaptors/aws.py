@@ -34,12 +34,17 @@ import threading
 import time
 from typing import Any, Callable
 
+from sky.adaptors import common
 from sky.utils import common_utils
 
-logger = logging.getLogger(__name__)
+_IMPORT_ERROR_MESSAGE = ('Failed to import dependencies for AWS. '
+                         'Try pip install "skypilot[aws]"')
+boto3 = common.LazyImport('boto3', import_error_message=_IMPORT_ERROR_MESSAGE)
+botocore = common.LazyImport('botocore',
+                             import_error_message=_IMPORT_ERROR_MESSAGE)
+_LAZY_MODULES = (boto3, botocore)
 
-boto3 = None
-botocore = None
+logger = logging.getLogger(__name__)
 _session_creation_lock = threading.RLock()
 
 version = 1
@@ -71,25 +76,6 @@ def _thread_local_lru_cache(maxsize=32):
         return wrapper
 
     return decorator
-
-
-def import_package(func):
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        global boto3, botocore
-        if boto3 is None or botocore is None:
-            try:
-                import boto3 as _boto3
-                import botocore as _botocore
-                boto3 = _boto3
-                botocore = _botocore
-            except ImportError:
-                raise ImportError('Fail to import dependencies for AWS. '
-                                  'Try pip install "skypilot[aws]"') from None
-        return func(*args, **kwargs)
-
-    return wrapper
 
 
 def _assert_kwargs_builtin_type(kwargs):
@@ -131,16 +117,22 @@ def _create_aws_object(creation_fn_or_cls: Callable[[], Any],
                         f'{common_utils.format_exception(e)}.')
 
 
-@import_package
 # The LRU cache needs to be thread-local to avoid multiple threads sharing the
 # same session object, which is not guaranteed to be thread-safe.
 @_thread_local_lru_cache()
-def session():
+def session(check_credentials: bool = True):
     """Create an AWS session."""
-    return _create_aws_object(boto3.session.Session, 'session')
+    s = _create_aws_object(boto3.session.Session, 'session')
+    if check_credentials and s.get_credentials() is None:
+        # s.get_credentials() can be None if there are actually no credentials,
+        # or if we fail to get credentials from IMDS (e.g. due to throttling).
+        # Technically, it could be okay to have no credentials, as certain AWS
+        # APIs don't actually need them. But afaik everything we use AWS for
+        # needs credentials.
+        raise botocore_exceptions().NoCredentialsError()
+    return s
 
 
-@import_package
 # Avoid caching the resource/client objects. If we are using the assumed role,
 # the credentials will be automatically rotated, but the cached resource/client
 # object will only refresh the credentials with a fixed 15 minutes interval,
@@ -165,14 +157,17 @@ def resource(service_name: str, **kwargs):
         config = botocore_config().Config(
             retries={'max_attempts': max_attempts})
         kwargs['config'] = config
+
+    check_credentials = kwargs.pop('check_credentials', True)
+
     # Need to use the client retrieved from the per-thread session to avoid
     # thread-safety issues (Directly creating the client with boto3.resource()
     # is not thread-safe). Reference: https://stackoverflow.com/a/59635814
     return _create_aws_object(
-        lambda: session().resource(service_name, **kwargs), 'resource')
+        lambda: session(check_credentials=check_credentials).resource(
+            service_name, **kwargs), 'resource')
 
 
-@import_package
 def client(service_name: str, **kwargs):
     """Create an AWS client of a certain service.
 
@@ -181,22 +176,26 @@ def client(service_name: str, **kwargs):
         kwargs: Other options.
     """
     _assert_kwargs_builtin_type(kwargs)
+
+    check_credentials = kwargs.pop('check_credentials', True)
+
     # Need to use the client retrieved from the per-thread session to avoid
     # thread-safety issues (Directly creating the client with boto3.client() is
     # not thread-safe). Reference: https://stackoverflow.com/a/59635814
 
-    return _create_aws_object(lambda: session().client(service_name, **kwargs),
-                              'client')
+    return _create_aws_object(
+        lambda: session(check_credentials=check_credentials).client(
+            service_name, **kwargs), 'client')
 
 
-@import_package
+@common.load_lazy_modules(modules=_LAZY_MODULES)
 def botocore_exceptions():
     """AWS botocore exception."""
     from botocore import exceptions
     return exceptions
 
 
-@import_package
+@common.load_lazy_modules(modules=_LAZY_MODULES)
 def botocore_config():
     """AWS botocore exception."""
     from botocore import config

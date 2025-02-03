@@ -3,7 +3,6 @@ import textwrap
 
 from click import testing as cli_testing
 
-import sky
 from sky import exceptions
 import sky.cli as cli
 
@@ -48,10 +47,9 @@ def test_accelerator_mismatch(enable_all_clouds):
 
 
 def test_show_gpus():
-    """
-    This is a test suite for `sky show-gpus` to check functionality (but not correctness).
-    The tests below correspond to the following terminal commands,
-    in order:
+    """Tests `sky show-gpus` can be invoked (but not correctness).
+
+    Tests below correspond to the following terminal commands, in order:
 
     -> sky show-gpus
     -> sky show-gpus --all
@@ -104,3 +102,40 @@ def test_show_gpus():
         result = cli_runner.invoke(cli.show_gpus,
                                    ['V100:4', '--cloud', cloud, '--all'])
         assert isinstance(result.exception, SystemExit)
+
+
+def test_k8s_alias_check():
+    cli_runner = cli_testing.CliRunner()
+
+    result = cli_runner.invoke(cli.check, ['k8s'])
+    assert not result.exit_code
+
+    result = cli_runner.invoke(cli.check, ['kubernetes'])
+    assert not result.exit_code
+
+    result = cli_runner.invoke(cli.check, ['notarealcloud'])
+    assert isinstance(result.exception, ValueError)
+
+
+def test_k8s_alias(enable_all_clouds):
+    cli_runner = cli_testing.CliRunner()
+
+    result = cli_runner.invoke(cli.launch, ['--cloud', 'k8s', '--dryrun'])
+    assert not result.exit_code
+
+    result = cli_runner.invoke(cli.launch,
+                               ['--cloud', 'kubernetes', '--dryrun'])
+    assert not result.exit_code
+
+    result = cli_runner.invoke(cli.launch,
+                               ['--cloud', 'notarealcloud', '--dryrun'])
+    assert isinstance(result.exception, ValueError)
+
+    result = cli_runner.invoke(cli.show_gpus, ['--cloud', 'k8s'])
+    assert not result.exit_code
+
+    result = cli_runner.invoke(cli.show_gpus, ['--cloud', 'kubernetes'])
+    assert not result.exit_code
+
+    result = cli_runner.invoke(cli.show_gpus, ['--cloud', 'notarealcloud'])
+    assert isinstance(result.exception, ValueError)

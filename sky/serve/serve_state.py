@@ -11,22 +11,31 @@ from typing import Any, Dict, List, Optional, Tuple
 import colorama
 
 from sky.serve import constants
+from sky.serve import load_balancing_policies as lb_policies
 from sky.utils import db_utils
 
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
     from sky.serve import service_spec
 
-_DB_PATH = pathlib.Path(constants.SKYSERVE_METADATA_DIR) / 'services.db'
-_DB_PATH = _DB_PATH.expanduser().absolute()
-_DB_PATH.parents[0].mkdir(parents=True, exist_ok=True)
-_DB_PATH = str(_DB_PATH)
+
+def _get_db_path() -> str:
+    """Workaround to collapse multi-step Path ops for type checker.
+    Ensures _DB_PATH is str, avoiding Union[Path, str] inference.
+    """
+    path = pathlib.Path(constants.SKYSERVE_METADATA_DIR) / 'services.db'
+    path = path.expanduser().absolute()
+    path.parents[0].mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+_DB_PATH: str = _get_db_path()
 
 
 def create_table(cursor: 'sqlite3.Cursor', conn: 'sqlite3.Connection') -> None:
     """Creates the service and replica tables if they do not exist."""
 
-    # auto_restart column is deprecated.
+    # auto_restart and requested_resources column is deprecated.
     cursor.execute("""\
         CREATE TABLE IF NOT EXISTS services (
         name TEXT PRIMARY KEY,
@@ -68,6 +77,11 @@ db_utils.add_column_to_table(_DB.cursor, _DB.conn, 'services',
 db_utils.add_column_to_table(_DB.cursor, _DB.conn, 'services',
                              'active_versions',
                              f'TEXT DEFAULT {json.dumps([])!r}')
+db_utils.add_column_to_table(_DB.cursor, _DB.conn, 'services',
+                             'load_balancing_policy', 'TEXT DEFAULT NULL')
+# Whether the service's load balancer is encrypted with TLS.
+db_utils.add_column_to_table(_DB.cursor, _DB.conn, 'services', 'tls_encrypted',
+                             'INTEGER DEFAULT 0')
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSG = 'UNIQUE constraint failed: services.name'
 
 
@@ -98,8 +112,17 @@ class ReplicaStatus(enum.Enum):
     # The replica VM is being shut down. i.e., the `sky down` is still running.
     SHUTTING_DOWN = 'SHUTTING_DOWN'
 
-    # The replica VM is once failed and has been deleted.
+    # The replica fails due to user's run/setup.
     FAILED = 'FAILED'
+
+    # The replica fails due to initial delay exceeded.
+    FAILED_INITIAL_DELAY = 'FAILED_INITIAL_DELAY'
+
+    # The replica fails due to healthiness check.
+    FAILED_PROBING = 'FAILED_PROBING'
+
+    # The replica fails during launching
+    FAILED_PROVISION = 'FAILED_PROVISION'
 
     # `sky.down` failed during service teardown.
     # This could mean resource leakage.
@@ -115,14 +138,15 @@ class ReplicaStatus(enum.Enum):
 
     @classmethod
     def failed_statuses(cls) -> List['ReplicaStatus']:
-        return [cls.FAILED, cls.FAILED_CLEANUP, cls.UNKNOWN]
+        return [
+            cls.FAILED, cls.FAILED_CLEANUP, cls.FAILED_INITIAL_DELAY,
+            cls.FAILED_PROBING, cls.FAILED_PROVISION, cls.UNKNOWN
+        ]
 
     @classmethod
     def terminal_statuses(cls) -> List['ReplicaStatus']:
-        return [
-            cls.SHUTTING_DOWN, cls.FAILED, cls.FAILED_CLEANUP, cls.PREEMPTED,
-            cls.UNKNOWN
-        ]
+        return [cls.SHUTTING_DOWN, cls.PREEMPTED, cls.UNKNOWN
+               ] + cls.failed_statuses()
 
     @classmethod
     def scale_down_decision_order(cls) -> List['ReplicaStatus']:
@@ -145,6 +169,9 @@ _REPLICA_STATUS_TO_COLOR = {
     ReplicaStatus.NOT_READY: colorama.Fore.YELLOW,
     ReplicaStatus.SHUTTING_DOWN: colorama.Fore.MAGENTA,
     ReplicaStatus.FAILED: colorama.Fore.RED,
+    ReplicaStatus.FAILED_INITIAL_DELAY: colorama.Fore.RED,
+    ReplicaStatus.FAILED_PROBING: colorama.Fore.RED,
+    ReplicaStatus.FAILED_PROVISION: colorama.Fore.RED,
     ReplicaStatus.FAILED_CLEANUP: colorama.Fore.RED,
     ReplicaStatus.PREEMPTED: colorama.Fore.MAGENTA,
     ReplicaStatus.UNKNOWN: colorama.Fore.RED,
@@ -202,7 +229,7 @@ class ServiceStatus(enum.Enum):
                for status in ReplicaStatus.failed_statuses()) > 0:
             return cls.FAILED
         # When min_replicas = 0, there is no (provisioning) replica.
-        if len(replica_statuses) == 0:
+        if not replica_statuses:
             return cls.NO_REPLICA
         return cls.REPLICA_INIT
 
@@ -220,7 +247,8 @@ _SERVICE_STATUS_TO_COLOR = {
 
 
 def add_service(name: str, controller_job_id: int, policy: str,
-                requested_resources_str: str, status: ServiceStatus) -> bool:
+                requested_resources_str: str, load_balancing_policy: str,
+                status: ServiceStatus, tls_encrypted: bool) -> bool:
     """Add a service in the database.
 
     Returns:
@@ -233,10 +261,11 @@ def add_service(name: str, controller_job_id: int, policy: str,
                 """\
                 INSERT INTO services
                 (name, controller_job_id, status, policy,
-                requested_resources_str)
-                VALUES (?, ?, ?, ?, ?)""",
+                requested_resources_str, load_balancing_policy, tls_encrypted)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (name, controller_job_id, status.value, policy,
-                 requested_resources_str))
+                 requested_resources_str, load_balancing_policy,
+                 int(tls_encrypted)))
 
     except sqlite3.IntegrityError as e:
         if str(e) != _UNIQUE_CONSTRAINT_FAILED_ERROR_MSG:
@@ -302,8 +331,13 @@ def set_service_load_balancer_port(service_name: str,
 
 def _get_service_from_row(row) -> Dict[str, Any]:
     (current_version, name, controller_job_id, controller_port,
-     load_balancer_port, status, uptime, policy, _, requested_resources,
-     requested_resources_str, _, active_versions) = row[:13]
+     load_balancer_port, status, uptime, policy, _, _, requested_resources_str,
+     _, active_versions, load_balancing_policy, tls_encrypted) = row[:15]
+    if load_balancing_policy is None:
+        # This entry in database was added in #4439, and it will always be set
+        # to a str value. If it is None, it means it is an legacy entry and is
+        # using the legacy default policy.
+        load_balancing_policy = lb_policies.LEGACY_DEFAULT_POLICY
     return {
         'name': name,
         'controller_job_id': controller_job_id,
@@ -319,11 +353,9 @@ def _get_service_from_row(row) -> Dict[str, Any]:
         # The versions that is active for the load balancer. This is a list of
         # integers in json format. This is mainly for display purpose.
         'active_versions': json.loads(active_versions),
-        # TODO(tian): Backward compatibility.
-        # Remove after 2 minor release, 0.6.0.
-        'requested_resources': pickle.loads(requested_resources)
-                               if requested_resources is not None else None,
         'requested_resources_str': requested_resources_str,
+        'load_balancing_policy': load_balancing_policy,
+        'tls_encrypted': bool(tls_encrypted),
     }
 
 
@@ -512,3 +544,12 @@ def delete_version(service_name: str, version: int) -> None:
             DELETE FROM version_specs
             WHERE service_name=(?)
             AND version=(?)""", (service_name, version))
+
+
+def delete_all_versions(service_name: str) -> None:
+    """Deletes all versions from the database."""
+    with db_utils.safe_cursor(_DB_PATH) as cursor:
+        cursor.execute(
+            """\
+            DELETE FROM version_specs
+            WHERE service_name=(?)""", (service_name,))
